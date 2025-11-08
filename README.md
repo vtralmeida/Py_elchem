@@ -1,9 +1,9 @@
-#Electrochemical data analysis library
+# Electrochemical data analysis library
 
-##Photocurrent analysis
+## Photocurrent analysis
 
 
-##Nyquist plot
+## Nyquist plot
 
-###Equivalent Circuit fitting
+### Equivalent Circuit fitting
 
