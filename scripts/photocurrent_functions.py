@@ -1,7 +1,9 @@
 import os
 import io
+from networkx import display
 import pandas as pd
 import numpy as np
+from scipy.signal import find_peaks, gaussian_filter1d
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks, savgol_filter
 from scipy.ndimage import gaussian_filter1d
@@ -197,144 +199,187 @@ def group_by_potential(
 
     return data_by_potential
 
+
+
 def process_photocurrent_robust(
     df_raw: pd.DataFrame,
     start_time_s: float = 30.0,
-    smoothing_sigma: float = 2.0,
     # ---- Outlier control (Hampel / MAD) ----
-    hampel_window_s: float = 1.0,     # window length (seconds) for outlier detection
-    hampel_nsigmas: float = 4.0,      # threshold multiplier on MAD
+    hampel_window_s: float = 1.0,
+    hampel_nsigmas: float = 4.0,
     # ---- Baseline detection ----
-    min_dark_gap_s: float = 45.0,     # expected minimum time between dark segments
-    anchor_quantile: float = 0.10,    # low-quantile for anchor value (robust against spikes)
-    anchor_halfwin_s: float = 2.0,    # +/- seconds around each anchor to take quantile
-    baseline_smoothing_sigma: float = 1.0,  # smooth baseline slightly
-    # ---- Averaging ----
-    light_on_quantile: float = 0.80,  # top-quantile to define “light on”
-    return_intermediates: bool = False
+    use_rolling_baseline: bool = True,
+    baseline_window_s: float = 60.0,
+    baseline_quantile: float = 0.10,
+    baseline_smoothing_sigma: float = 15.0,
+    # ---- Averaging (NEW: Plateau Range) ----
+    # Average ONLY between these percentiles (e.g., 70th to 95th)
+    # This cuts off the top 5% of data (the high outliers)
+    plateau_range: tuple = (0.70, 0.95),
+    smoothing_sigma: float = 1.0,
 ):
-    """
-    Robust photocurrent processing with outlier rejection and a spike-resistant dynamic baseline.
-
-    Expects columns:
-        - 'Time_s' (seconds, monotonically increasing)
-        - 'Current_uA' (microamps)
-
-    Returns
-    -------
-    df_processed : DataFrame with columns:
-        ['Time_s', 'Current_uA_raw', 'Current_uA_despiked', 'Baseline', 'Photocurrent_uA']
-    avg_photocurrent : float (mean over the top quantile of 'Photocurrent_uA')
-    (optionally) extras dict when return_intermediates=True
-    """
-    # ---------- 0) Guardrails & prep ----------
-    if df_raw is None or df_raw.empty:
-        return None, None
-
-    # Work on a copy, ensure sorted time and no duplicates
-    df = df_raw.copy()
-    df = df.sort_values('Time_s').drop_duplicates(subset='Time_s')
-    # Cut to analysis window and zero time
+    # 0) Guardrails & prep
+    if df_raw is None or df_raw.empty: return None, None
+    df = df_raw.copy().sort_values('Time_s').drop_duplicates('Time_s')
     df = df[df['Time_s'] >= start_time_s].copy()
-    if df.empty:
-        return None, None
-    df['Time_s'] = df['Time_s'] - start_time_s
-    df.reset_index(drop=True, inplace=True)
-
-    # Sampling rate estimate (robust to jitter)
-    dt = np.median(np.diff(df['Time_s'].to_numpy()))
-    if not np.isfinite(dt) or dt <= 0:
-        # Fallback to mean if median fails
-        dt = df['Time_s'].diff().mean()
-    if not np.isfinite(dt) or dt <= 0:
-        return None, None
-    fs = 1.0 / dt
-
-    # Keep original (raw) current
+    if df.empty: return None, None
+    df['Time_s'] -= start_time_s
+    dt = np.median(np.diff(df['Time_s']))
+    if dt <= 0: dt = df['Time_s'].diff().mean()
+    fs = 1.0 / dt if dt > 0 else 1.0
     y_raw = df['Current_uA'].to_numpy().astype(float)
 
-    # ---------- 1) Despike with a Hampel filter (MAD-based) ----------
-    def hampel_despike(y, win_samples, n_sigmas=4.0):
-        y = y.copy()
-        half = int(max(1, win_samples // 2))
-        for i in range(len(y)):
-            left = max(0, i - half)
-            right = min(len(y), i + half + 1)
-            window = y[left:right]
-            med = np.median(window)
-            mad = np.median(np.abs(window - med))  # median absolute deviation
-            # Consistent with normal dist: sigma ≈ 1.4826 * MAD
-            sigma = 1.4826 * mad if mad > 0 else 0.0
-            if sigma > 0 and np.abs(y[i] - med) > n_sigmas * sigma:
-                # Replace outlier by local median
-                y[i] = med
-        return y
+    # 1) FAST Hampel Despike
+    win = max(3, int(hampel_window_s * fs))
+    y_ser = pd.Series(y_raw)
+    rol_med = y_ser.rolling(win, center=True, min_periods=1).median()
+    rol_mad = (y_ser - rol_med).abs().rolling(win, center=True, min_periods=1).median()
+    mask = (y_ser - rol_med).abs() > (hampel_nsigmas * 1.4826 * rol_mad)
+    y_despiked = y_raw.copy()
+    y_despiked[mask] = rol_med[mask]
 
-    hampel_win = max(3, int(round(hampel_window_s * fs)))
-    y_despiked = hampel_despike(y_raw, hampel_win, hampel_nsigmas)
-
-    # Optional tiny smoothing to help baseline anchors (does not blur steps much)
-    y_for_anchors = gaussian_filter1d(y_despiked, sigma=max(0.5, baseline_smoothing_sigma))
-
-    # ---------- 2) Find dark anchors (on *inverted* despiked/smoothed current) ----------
-    min_peak_distance = max(1, int(round(min_dark_gap_s * fs)))
-    inv = -y_for_anchors
-    # dark_idxs, _ = find_peaks(inv, distance=min_peak_distance)
-    print(min_peak_distance)
-    dark_idxs, _ = find_peaks(inv, distance=100,height=-.10)
-
-    # Always include start/end as anchors
-    anchor_indices = np.unique(
-        np.concatenate(([0], dark_idxs, [len(df) - 1]))
-    )
-
-    # Robust anchor values: low quantile within a small neighborhood (immune to spikes)
-    halfwin = max(1, int(round(anchor_halfwin_s * fs)))
-    anchor_values = []
-    for idx in anchor_indices:
-        left = max(0, idx - halfwin)
-        right = min(len(df), idx + halfwin + 1)
-        anchor_values.append(np.quantile(y_despiked[left:right], anchor_quantile))
-    anchor_values = np.asarray(anchor_values, dtype=float)
-
-    # ---------- 3) Build dynamic baseline (interp + slight smooth) ----------
-    baseline = np.interp(np.arange(len(df)), anchor_indices, anchor_values)
-    if baseline_smoothing_sigma and baseline_smoothing_sigma > 0:
+    # 2) Baseline (Rolling Quantile)
+    b_win = int(baseline_window_s * fs)
+    baseline = pd.Series(y_despiked).rolling(b_win, center=True, min_periods=1).quantile(baseline_quantile)
+    baseline = baseline.bfill().ffill().to_numpy()
+    if baseline_smoothing_sigma > 0:
         baseline = gaussian_filter1d(baseline, sigma=baseline_smoothing_sigma)
 
-    # ---------- 4) Subtract baseline, clip at 0, optional smoothing ----------
-    photo = y_despiked - baseline
-    photo = np.clip(photo, 0, None)
-    if smoothing_sigma and smoothing_sigma > 0:
+    # 3) Subtract & Smooth
+    photo = np.clip(y_despiked - baseline, 0, None)
+    if smoothing_sigma > 0:
         photo = gaussian_filter1d(photo, sigma=smoothing_sigma)
 
-    # ---------- 5) Average photocurrent over “light on” region ----------
-    thr = np.quantile(photo, light_on_quantile) if np.any(np.isfinite(photo)) else np.nan
-    avg_photo = float(np.nanmean(photo[photo >= thr])) if np.isfinite(thr) else np.nan
+    # 4) NEW: Robust Averaging (Trimmed Mean)
+    # Calculate the lower and upper bounds of your plateau
+    q_low = np.nanquantile(photo, plateau_range[0])
+    q_high = np.nanquantile(photo, plateau_range[1])
 
-    # ---------- 6) Package result ----------
+    # Select points ONLY within this safe range
+    mask_plateau = (photo >= q_low) & (photo <= q_high)
+
+    # Calculate average of these safe points
+    if mask_plateau.any():
+        avg_photo = float(np.nanmean(photo[mask_plateau]))
+    else:
+        avg_photo = np.nan
+
+    # 5) Package
     df_out = pd.DataFrame({
         'Time_s': df['Time_s'].to_numpy(),
-        'Current_uA_raw': y_raw[:len(df)],          # raw (post time-cut)
+        'Current_uA_raw': y_raw,
         'Current_uA_despiked': y_despiked,
         'Baseline': baseline,
         'Photocurrent_uA': photo
     })
-
-    if return_intermediates:
-        extras = {
-            'sampling_rate_hz': fs,
-            'anchor_indices': anchor_indices,
-            'anchor_values': anchor_values,
-            'median_dt_s': float(dt)
-        }
-        return df_out, avg_photo, extras
-
     return df_out, avg_photo
 
 
-####### PLOT FUNCTION ########
+# def process_photocurrent_robust(
+#     df_raw: pd.DataFrame,
+#     start_time_s: float = 30.0,
+#     smoothing_sigma: float = 2.0,
+#     # ---- Outlier control (Hampel / MAD) ----
+#     hampel_window_s: float = 1.0,
+#     hampel_nsigmas: float = 4.0,
+#     # ---- New Rolling Baseline Parameters ----
+#     use_rolling_baseline: bool = True,
+#     baseline_window_s: float = 60.0,   # MUST be > than widest light pulse
+#     baseline_quantile: float = 0.10,   # "Rides" the bottom 10% of noise
+#     # ---- Old Anchor Baseline Parameters (kept for fallback) ----
+#     min_dark_gap_s: float = 10.0,
+#     anchor_quantile: float = 0.50,
+#     anchor_halfwin_s: float = 2.0,
+#     # ---- Common ----
+#     baseline_smoothing_sigma: float = 2.0, # Increased slightly for rolling method
+#     light_on_quantile: float = 0.80,
+#     return_intermediates: bool = False
+# ):
+#     # ---------- 0) Guardrails & prep ----------
+#     if df_raw is None or df_raw.empty: return None, None
+#     df = df_raw.copy()
+#     df = df.sort_values('Time_s').drop_duplicates(subset='Time_s')
+#     df = df[df['Time_s'] >= start_time_s].copy()
+#     if df.empty: return None, None
+#     df['Time_s'] = df['Time_s'] - start_time_s
+#     df.reset_index(drop=True, inplace=True)
 
+#     dt = np.median(np.diff(df['Time_s'].to_numpy()))
+#     if not np.isfinite(dt) or dt <= 0: dt = df['Time_s'].diff().mean()
+#     if not np.isfinite(dt) or dt <= 0: return None, None
+#     fs = 1.0 / dt
+#     y_raw = df['Current_uA'].to_numpy().astype(float)
+
+#     # ---------- 1) FAST Hampel Despike (Pandas Optimized) ----------
+#     hampel_win = max(3, int(round(hampel_window_s * fs)))
+#     y_series = pd.Series(y_raw)
+    
+#     rolling_med = y_series.rolling(window=hampel_win, center=True, min_periods=1).median()
+#     rolling_mad = (y_series - rolling_med).abs().rolling(window=hampel_win, center=True, min_periods=1).median()
+#     rolling_sigma = 1.4826 * rolling_mad
+    
+#     outlier_mask = (y_series - rolling_med).abs() > (hampel_nsigmas * rolling_sigma)
+#     y_despiked = y_series.copy()
+#     y_despiked[outlier_mask] = rolling_med[outlier_mask]
+#     y_despiked = y_despiked.to_numpy()
+
+#     # ---------- 2 & 3) Baseline Detection ----------
+#     if use_rolling_baseline:
+#         # --- NEW METHOD: Rolling Quantile ---
+#         # 1. Define window width in samples
+#         b_win = int(baseline_window_s * fs)
+#         # 2. Calculate rolling quantile (the "floor" of the data)
+#         baseline = pd.Series(y_despiked).rolling(window=b_win, center=True, min_periods=1).quantile(baseline_quantile)
+#         # 3. Fill edges where rolling window doesn't have enough data
+#         baseline = baseline.bfill().ffill()
+#         # 4. Convert to numpy
+#         baseline = baseline.to_numpy()
+        
+#     else:
+#         # --- OLD METHOD: Anchors (kept as fallback) ---
+#         y_for_anchors = gaussian_filter1d(y_despiked, sigma=max(0.5, baseline_smoothing_sigma))
+#         min_peak_dist = max(1, int(round(min_dark_gap_s * fs)))
+#         # Find dark regions (peaks in inverted signal)
+#         dark_idxs, _ = find_peaks(-y_for_anchors, distance=min_peak_dist, height=None) # height removed for robustness
+#         anchor_indices = np.unique(np.concatenate(([0], dark_idxs, [len(df) - 1])))
+
+#         halfwin = max(1, int(round(anchor_halfwin_s * fs)))
+#         anchor_vals = []
+#         for idx in anchor_indices:
+#             l, r = max(0, idx - halfwin), min(len(df), idx + halfwin + 1)
+#             anchor_vals.append(np.quantile(y_despiked[l:r], anchor_quantile))
+#         baseline = np.interp(np.arange(len(df)), anchor_indices, anchor_vals)
+
+#     # Common: Final Baseline Smoothing
+#     if baseline_smoothing_sigma > 0:
+#         # If using rolling, we might need stronger smoothing to remove "steps"
+#         actual_smooth = baseline_smoothing_sigma * (5.0 if use_rolling_baseline else 1.0)
+#         baseline = gaussian_filter1d(baseline, sigma=actual_smooth)
+
+#     # ---------- 4) Subtract & Clip ----------
+#     photo = np.clip(y_despiked - baseline, 0, None)
+#     if smoothing_sigma > 0:
+#         photo = gaussian_filter1d(photo, sigma=smoothing_sigma)
+
+#     # ---------- 5) Average Light-On ----------
+#     thr = np.quantile(photo, light_on_quantile) if np.any(np.isfinite(photo)) else np.nan
+#     avg_photo = float(np.nanmean(photo[photo >= thr])) if np.isfinite(thr) else np.nan
+
+#     # ---------- 6) Package ----------
+#     df_out = pd.DataFrame({
+#         'Time_s': df['Time_s'].to_numpy(),
+#         'Current_uA_raw': y_raw[:len(df)],
+#         'Current_uA_despiked': y_despiked,
+#         'Baseline': baseline,
+#         'Photocurrent_uA': photo
+#     })
+
+#     if return_intermediates:
+#         return df_out, avg_photo, {'fs': fs}
+#     return df_out, avg_photo
+
+
+####### PLOT FUNCTION ########
 def align_window_and_pad(
     df: pd.DataFrame,
     time_col: str = "Time_s",
